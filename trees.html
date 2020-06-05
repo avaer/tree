@@ -1,0 +1,927 @@
+<!doctype html>
+<html>
+
+<head>
+  <title>xrpackage | trees</title>
+  <link rel=icon type="image/png" href="favicon.png">
+  <link href="/index.css" rel=stylesheet>
+  <link href="https://fonts.googleapis.com/css?family=Open+Sans:300,400,600,700&display=swap" rel="stylesheet">
+  <script src="https://kit.fontawesome.com/0735724151.js" crossorigin="anonymous"></script>
+</head>
+
+<body class="header-gap">
+  <header class=header id=header>
+    <a href="/" class="nav icon">山</a>
+    <nav class="selector nav bar" id=selector>
+      <i class="fa fa-user head"></i>
+      <div class=header-label id=header-label>Log in</div>
+      <i class="fa fa-chevron-down tail"></i>
+      <div class=selections id=selections>
+        <a href="run.html" class=selection id=run-mode>
+          <i class="fa fa-play"></i>
+          <div class=wrap>
+            <h3>Run mode</h3>
+            <p>Switch to run mode</p>
+          </div>
+        </a>
+        <a href="edit.html" class=selection id=edit-mode>
+          <i class="fa fa-pencil"></i>
+          <div class=wrap>
+            <h3>Edit mode</h3>
+            <p>You are currently editing this world</p>
+          </div>
+        </a>
+        <a href="browse.html" class="selection dim">
+          <i class="fa fa-solar-system"></i>
+          <div class=wrap>
+            <h3>Browse packages</h3>
+            <p>Explore the XRPackage registry</p>
+          </div>
+        </a>
+        <a href="help.html" class=selection>
+          <i class="fa fa-book"></i>
+          <div class=wrap>
+            <h3>Documentation</h3>
+            <p>Learn how to make packages and worlds</p>
+          </div>
+        </a>
+      </div>
+    </nav>
+
+    <form class="login-form phase-1" id=login-form>
+      <div class=phase-content>
+        <div class=login-notice id=login-notice></div>
+        <div class=login-error id=login-error></div>
+      </div>
+      <div class="phase-content phase-1-content">
+        <input type=email placeholder="your@email.com" id=login-email>
+        <input type=submit value="Log in" class="button highlight">
+      </div>
+      <div class="phase-content phase-2-content">
+        <input type=text placeholder="Verification code" id=login-verification-code>
+        <input type=submit value="Verify" class="button highlight">
+      </div>
+      <div class="phase-content phase-3-content">
+        <nav class=user-button id=user-button>
+          <img src="favicon.ico">
+          <span class=name id=login-email-static></span>
+          <input type=submit value="Log out" class="button highlight">
+        </nav>
+      </div>
+      <div class="phase-content phaseless-content">
+        <div>Working...</div>
+      </div>
+    </form>
+  </header>
+
+<script type=module>
+
+import * as THREE from './three.module.js';
+import {OrbitControls} from './OrbitControls.js';
+import alea from './alea.js';
+import indev from './indev.js';
+import murmur from './murmur.js';
+import {
+  NUM_CELLS,
+  OVERSCAN,
+  NUM_CELLS_OVERSCAN,
+
+  DEFAULT_SEED,
+
+  NUM_CELLS_HEIGHT,
+  HEIGHT_OFFSET,
+
+  RANGE,
+} from './constants.js';
+import * as protocolUtils from './protocol-utils.js';
+
+const NUM_POSITIONS = 30 * 1024;
+const NUM_POSITIONS_CHUNK = 500 * 1024;
+const CAMERA_ROTATION_ORDER = 'YXZ';
+const TEXTURE_SIZE = 1024;
+const TEXTURE_CHUNK_SIZE = 512;
+const NUM_TEXTURE_CHUNKS_WIDTH = TEXTURE_SIZE / TEXTURE_CHUNK_SIZE;
+
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: true,
+});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.sortObjects = false;
+renderer.physicallyCorrectLights = true;
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 0, 2);
+
+const orbitControls = new OrbitControls(camera, renderer.domElement);
+orbitControls.screenSpacePanning = true;
+orbitControls.enableMiddleZoom = false;
+// orbitControls.update();
+
+const upVector = new THREE.Vector3(0, 1, 0);
+const sideQuaternion = new THREE.Quaternion().setFromUnitVectors(
+  upVector,
+  new THREE.Vector3(1, 0, 0)
+);
+
+const rng = new alea(DEFAULT_SEED);
+const generator = indev({
+  seed: DEFAULT_SEED,
+});
+const elevationNoise = generator.uniform({
+  frequency: 0.002,
+  octaves: 8,
+});
+const treeNoise = generator.uniform({
+  frequency: 0.1,
+  octaves: 4,
+});
+
+class Box {
+  constructor(min, max) {
+    this.min = min;
+    this.max = max;
+  }
+}
+class Triangle {
+  constructor(a, b, c) {
+    this.a = a;
+    this.b = b;
+    this.c = c;
+  }
+}
+
+const _copyIndices = (src, dst, startIndexIndex, startAttributeIndex) => {
+  for (let i = 0; i < src.length; i++) {
+    dst[startIndexIndex + i] = src[i] + startAttributeIndex;
+  }
+};
+
+const baseLeafColor = new THREE.Color(0x8BC34A);
+const baseTrunkColor = new THREE.Color(0x795548);
+const lightTrunkColor = new THREE.Color(0x5D4037);
+const _isPointInBox = (p, b) => p.x >= b.min.x && p.x < b.max.x && p.y >= b.min.y && p.y < b.max.y;
+const _isPointInBoxes = (p, bs) => {
+  for (let i = 0; i < bs.length; i++) {
+    const b = bs[i];
+    if (_isPointInBox(p, b)) {
+      return true;
+    }
+  }
+  return false;
+};
+const _isPointInTriangle = (p, tri) => {
+  const {a: p0, b: p1, c: p2} = tri;
+  const A = 1/2 * (-p1.y * p2.x + p0.y * (-p1.x + p2.x) + p0.x * (p1.y - p2.y) + p1.x * p2.y);
+  const sign = A < 0 ? -1 : 1;
+  const s = (p0.y * p2.x - p0.x * p2.y + (p2.y - p0.y) * p.x + (p0.x - p2.x) * p.y) * sign;
+  const t = (p0.x * p1.y - p0.y * p1.x + (p0.y - p1.y) * p.x + (p1.x - p0.x) * p.y) * sign;
+
+  return s > 0 && t > 0 && (s + t) < 2 * A * sign;
+};
+const _isPointInTriangles = (p, ts) => {
+  for (let i = 0; i < ts.length; i++) {
+    const t = ts[i];
+    if (_isPointInTriangle(p, t)) {
+      return true;
+    }
+  }
+  return false;
+};
+const treeTextureAtlas = (() => {
+  const transparentColorArray = Uint8Array.from([0, 0, 0, 0]);
+
+  const data = new Uint8Array(TEXTURE_SIZE * TEXTURE_SIZE * 4);
+  for (let y = 0; y < NUM_TEXTURE_CHUNKS_WIDTH; y++) {
+    for (let x = 0; x < NUM_TEXTURE_CHUNKS_WIDTH; x++) {
+      if (x === 0) { // trunk
+        const numBoxes = Math.floor(50 + rng() * 50);
+        const boxes = Array(numBoxes);
+        for (let i = 0; i < numBoxes; i++) {
+          const min = new THREE.Vector2(rng(), rng());
+          const max = min.clone().add(new THREE.Vector2(rng() * 0.02, rng() * 0.04));
+          const box = new Box(min, max);
+          boxes[i] = box;
+        }
+
+        for (let dy = 0; dy < TEXTURE_CHUNK_SIZE; dy++) {
+          for (let dx = 0; dx < TEXTURE_CHUNK_SIZE; dx++) {
+            const ax = (x * TEXTURE_CHUNK_SIZE) + dx;
+            const ay = (y * TEXTURE_CHUNK_SIZE) + dy;
+            const baseIndex = (ax + (ay * TEXTURE_SIZE)) * 4;
+
+            data.set(
+              Uint8Array.from(
+                (_isPointInBoxes(
+                  new THREE.Vector2(dx / TEXTURE_CHUNK_SIZE, 1 - (dy / TEXTURE_CHUNK_SIZE)),
+                  boxes
+                ) ? lightTrunkColor.clone() : baseTrunkColor.clone().multiplyScalar(0.2 + ((1 - (dy / TEXTURE_CHUNK_SIZE)) * 0.8)))
+                  .toArray()
+                  .concat([1])
+                  .map(v => Math.floor(v * 255))
+              ),
+              baseIndex,
+              4
+            );
+          }
+        }
+      } else { // leaf
+        const numBlades = Math.floor(5 + (rng() * 5));
+        const numTrianglesPerBlade = 5;
+        const numTriangles = numBlades * numTrianglesPerBlade;
+        const triangles = [];
+        for (let i = 0; i < numBlades; i++) {
+          const type = Math.floor(rng() * (2 + 1));
+          const w = (() => {
+            switch (type) {
+              case 0: return 0.05;
+              case 1: return 0.1;
+              case 2: return 0.15;
+            }
+          })();
+          const h = (() => {
+            switch (type) {
+              case 0: return 0.2;
+              case 1: return 0.2;
+              case 2: return 0.275;
+            }
+          })();
+          const ox = rng() * (1 - w);
+          const sy = (1 / h) * (0.25 + rng() * 0.75);
+          const points = (() => {
+            switch (type) {
+              case 0: {
+                return [
+                  new THREE.Vector2(0, 0),
+                  new THREE.Vector2(-0.05, 0.1),
+                  new THREE.Vector2(0.05, 0.1),
+
+                  new THREE.Vector2(-0.05, 0.1),
+                  new THREE.Vector2(0, 0.2),
+                  new THREE.Vector2(0.05, 0.1),
+                ];
+              }
+              case 1: {
+                return [
+                  new THREE.Vector2(0, 0),
+                  new THREE.Vector2(-0.1, 0.2),
+                  new THREE.Vector2(0, 0.1),
+
+                  new THREE.Vector2(0, 0),
+                  new THREE.Vector2(0.1, 0.2),
+                  new THREE.Vector2(0, 0.1),
+                ];
+              }
+              case 2: {
+                return [
+                  new THREE.Vector2(0, 0),
+                  new THREE.Vector2(-0.15, 0.15),
+                  new THREE.Vector2(0, 0.175),
+
+                  new THREE.Vector2(0, 0),
+                  new THREE.Vector2(0.15, 0.15),
+                  new THREE.Vector2(0, 0.175),
+
+                  new THREE.Vector2(-0.075, 0.075),
+                  new THREE.Vector2(0, 0.275),
+                  new THREE.Vector2(0.075, 0.075),
+                ];
+              }
+            }
+          })().map(v => v
+            .multiply(new THREE.Vector2(1, sy))
+            .add(new THREE.Vector2(ox, 0))
+          );
+
+          const numTriangles = points.length / 3;
+          for (let j = 0; j < numTriangles; j++) {
+            const baseIndex = j * 3;
+            const triangle = new Triangle(
+              points[baseIndex + 0],
+              points[baseIndex + 1],
+              points[baseIndex + 2]
+            );
+            triangles.push(triangle);
+          }
+        }
+
+        for (let dy = 0; dy < TEXTURE_CHUNK_SIZE; dy++) {
+          for (let dx = 0; dx < TEXTURE_CHUNK_SIZE; dx++) {
+            const ax = (x * TEXTURE_CHUNK_SIZE) + dx;
+            const ay = (y * TEXTURE_CHUNK_SIZE) + dy;
+            const baseIndex = (ax + (ay * TEXTURE_SIZE)) * 4;
+
+            data.set(
+              _isPointInTriangles(
+                new THREE.Vector2(dx / TEXTURE_CHUNK_SIZE, 1 - (dy / TEXTURE_CHUNK_SIZE)),
+                triangles
+              ) ? Uint8Array.from(
+                baseLeafColor.clone()
+                  .multiplyScalar(0.3 + ((1 - (dy / TEXTURE_CHUNK_SIZE)) * 1))
+                .toArray()
+                .concat([1])
+                .map(v => Math.floor(v * 255))
+              ) : transparentColorArray,
+              baseIndex,
+              4
+            );
+          }
+        }
+      }
+    }
+  }
+  return data;
+})();
+
+const treeTemplates = (() => {
+  const trunkGeometries = [
+    (() => {
+      const radiusBottom = 0.3 + rng() * 0.3;
+      const radiusTop = radiusBottom * (0.2 + (rng() * 0.3));
+      const heightSegments = 16;
+      const radialSegments = 5;
+      const geometry = new THREE.CylinderBufferGeometry(radiusTop, radiusBottom, heightSegments, radialSegments, heightSegments);
+      geometry.deleteAttribute('normal');
+      geometry.applyMatrix4(new THREE.Matrix4().makeTranslation(0, heightSegments / 2, 0));
+      const positions = geometry.getAttribute('position').array;
+      const uvs = geometry.getAttribute('uv').array;
+
+      const heightOffsets = {};
+      let heightOffset = new THREE.Vector3();
+      heightOffsets[0] = heightOffset;
+      for (let i = 1; i <= heightSegments; i++) {
+        heightOffset = heightOffset.clone()
+          .multiplyScalar(0.8)
+          .add(new THREE.Vector3(
+            -0.6 + (rng() * 0.6),
+            0,
+            -0.6 + (rng() * 0.6)
+          ));
+        heightOffsets[i] = heightOffset;
+      }
+
+      const numPositions = positions.length / 3;
+      const tx = 0; // 0 is trunk textures
+      const ty = Math.floor(rng() * NUM_TEXTURE_CHUNKS_WIDTH);
+      for (let i = 0; i < numPositions; i++) {
+        const baseIndex3 = i * 3;
+        const y = positions[baseIndex3 + 1];
+        const heightOffset = heightOffsets[y];
+
+        positions[baseIndex3 + 0] += heightOffset.x;
+        // positions[baseIndex + 1] += heightOffset.y;
+        positions[baseIndex3 + 2] += heightOffset.z;
+
+        const baseIndex2 = i * 2;
+        uvs[baseIndex2 + 0] = ((tx + (0.02 + uvs[baseIndex2 + 0] * 0.96)) / NUM_TEXTURE_CHUNKS_WIDTH);
+        uvs[baseIndex2 + 1] = 1 - ((tx + (1 - (0.02 + uvs[baseIndex2 + 1] * 0.96))) / NUM_TEXTURE_CHUNKS_WIDTH);
+      }
+
+      geometry.heightSegments = heightSegments;
+      geometry.radialSegments = radialSegments;
+      geometry.heightOffsets = heightOffsets;
+
+      return geometry;
+    })(),
+  ];
+  const _makeTreeBranchGeometry = heightSegments => {
+    const radiusBottom = 0.1 + rng() * 0.1;
+    const radiusTop = radiusBottom * (0.2 + (rng() * 0.3));
+    const radialSegments = 3;
+    const geometry = new THREE.CylinderBufferGeometry(radiusTop, radiusBottom, heightSegments, radialSegments, heightSegments);
+    geometry.deleteAttribute('normal');
+    geometry.applyMatrix4(new THREE.Matrix4().makeTranslation(0, heightSegments / 2, 0));
+    const positions = geometry.getAttribute('position').array;
+    const uvs = geometry.getAttribute('uv').array;
+
+    const heightOffsets = {};
+    let heightOffset = new THREE.Vector3();
+    heightOffsets[0] = heightOffset;
+    for (let i = 1; i <= heightSegments; i++) {
+      heightOffset = heightOffset.clone()
+         .multiplyScalar(0.8)
+        .add(new THREE.Vector3(
+          -0.6 + (rng() * 0.6),
+          0,
+          -0.6 + (rng() * 0.6)
+        ));
+      heightOffsets[i] = heightOffset;
+    }
+
+    const numPositions = positions.length / 3;
+    const tx = 0; // 0 is trunk textures
+    const ty = Math.floor(rng() * NUM_TEXTURE_CHUNKS_WIDTH);
+    for (let i = 0; i < numPositions; i++) {
+      const baseIndex3 = i * 3;
+      const y = positions[baseIndex3 + 1];
+      const heightOffset = heightOffsets[y];
+
+      positions[baseIndex3 + 0] += heightOffset.x;
+      // positions[baseIndex + 1] += heightOffset.y;
+      positions[baseIndex3 + 2] += heightOffset.z;
+
+      const baseIndex2 = i * 2;
+      uvs[baseIndex2 + 0] = ((tx + (0.02 + uvs[baseIndex2 + 0] * 0.96)) / NUM_TEXTURE_CHUNKS_WIDTH);
+      uvs[baseIndex2 + 1] = 1 - ((tx + (1 - (0.02 + uvs[baseIndex2 + 1] * 0.96))) / NUM_TEXTURE_CHUNKS_WIDTH);
+    }
+
+    geometry.applyMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(sideQuaternion));
+
+    return geometry;
+  };
+  const _makeTreeBranchGeometrySize = heightSegments => {
+    const numChoices = 4;
+    const result = Array(numChoices);
+    for (let i = 0; i < numChoices; i++) {
+      result[i] = _makeTreeBranchGeometry(heightSegments);
+    };
+    return result;
+  };
+  const branchGeometrySizes = [
+    _makeTreeBranchGeometrySize(4),
+    _makeTreeBranchGeometrySize(5),
+    _makeTreeBranchGeometrySize(6),
+    _makeTreeBranchGeometrySize(7),
+    _makeTreeBranchGeometrySize(8),
+    _makeTreeBranchGeometrySize(9),
+    _makeTreeBranchGeometrySize(10),
+  ];
+
+  const treeGeometry = (() => {
+    const positions = new Float32Array(NUM_POSITIONS * 3);
+    const uvs = new Float32Array(NUM_POSITIONS * 2);
+    const indices = new Uint16Array(NUM_POSITIONS);
+    let attributeIndex = 0;
+    let uvIndex = 0;
+    let indexIndex = 0;
+
+    const _renderTrunk = () => {
+      const trunkGeometry = trunkGeometries[Math.floor(rng() * trunkGeometries.length)];
+      const geometry = trunkGeometry;
+      const newPositions = geometry.getAttribute('position').array;
+      positions.set(newPositions, attributeIndex);
+      const newUvs = geometry.getAttribute('uv').array;
+      uvs.set(newUvs, uvIndex);
+      const newIndices = geometry.index.array;
+      _copyIndices(newIndices, indices, indexIndex, attributeIndex / 3);
+
+      attributeIndex += newPositions.length;
+      uvIndex += newUvs.length;
+      indexIndex += newIndices.length;
+
+      return trunkGeometry;
+    };
+    const trunkGeometrySpec = _renderTrunk();
+
+    const _renderBranches = trunkGeometrySpec => {
+      const {heightSegments, heightOffsets} = trunkGeometrySpec;
+
+      const branchGeometrySpec = [];
+      for (let i = Math.floor(heightSegments * 0.4); i < heightSegments; i++) {
+        const heightOffset = heightOffsets[i];
+
+        const maxNumBranchesPerNode = 2;
+        const optimalBranchHeight = 0.7;
+        const branchWeight = 1 - Math.pow(Math.abs(i - (heightSegments * optimalBranchHeight)) / (heightSegments * optimalBranchHeight), 0.25);
+        for (let j = 0; j < maxNumBranchesPerNode; j++) {
+          if (rng() < branchWeight) {
+            const branchSizeIndex = branchWeight === 1 ? (branchGeometrySizes.length - 1) : Math.floor(branchWeight * branchGeometrySizes.length);
+            const branchGeometries = branchGeometrySizes[branchSizeIndex];
+            const branchGeometry = branchGeometries[Math.floor(rng() * branchGeometries.length)];
+            const geometry = branchGeometry
+              .clone()
+              .applyMatrix4(new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(
+                rng() * Math.PI / 6,
+                rng() * Math.PI * 2,
+                rng() * Math.PI / 6,
+                CAMERA_ROTATION_ORDER
+              )))
+              .applyMatrix4(new THREE.Matrix4().makeTranslation(
+                heightOffset.x,
+                i,
+                heightOffset.z
+              ));
+            const newPositions = geometry.getAttribute('position').array;
+            positions.set(newPositions, attributeIndex);
+            const newUvs = geometry.getAttribute('uv').array;
+            uvs.set(newUvs, uvIndex);
+            const newIndices = geometry.index.array;
+            _copyIndices(newIndices, indices, indexIndex, attributeIndex / 3);
+
+            branchGeometrySpec.push(geometry);
+
+            attributeIndex += newPositions.length;
+            uvIndex += newUvs.length;
+            indexIndex += newIndices.length;
+          }
+        }
+      }
+
+      return branchGeometrySpec;
+    };
+    const branchGeometrySpec = _renderBranches(trunkGeometrySpec);
+
+    const _renderLeaves = branchGeometrySpec => {
+      const numLeaves = 50;
+      for (let i = 0; i < numLeaves; i++) {
+        const branchGeometry = branchGeometrySpec[Math.floor(rng() * branchGeometrySpec.length)];
+        const branchPositions = branchGeometry.getAttribute('position').array;
+        // const branchNormals = branchGeometry.getAttribute('normal').array;
+        const numPositions = branchPositions.length / 3;
+        // const index1 = Math.floor((1 - Math.pow(rng(), 0.5)) * numPositions);
+        const index1 = Math.floor(rng() * numPositions);
+        const index2 = (index1 < (numPositions - 1)) ? (index1 + 1) : (index1 - 1); // XXX bugfix this to scan to a position with a different y
+        const baseIndex1 = index1 * 3;
+        const baseIndex2 = index2 * 3;
+        const lerpFactor = rng();
+        const inverseLerpFactor = 1 - lerpFactor;
+
+        const geometry = new THREE.PlaneBufferGeometry(1, 1)
+          .applyMatrix4(new THREE.Matrix4().makeTranslation(0, 1 / 2, 0))
+          .applyMatrix4(new THREE.Matrix4().makeScale(
+            3,
+            3,
+            1
+          ))
+          .applyMatrix4(new THREE.Matrix4().makeRotationFromEuler(new THREE.Euler(
+            rng() * Math.PI / 2,
+            rng() * (Math.PI * 2),
+            0,
+            CAMERA_ROTATION_ORDER
+          )))
+          /* .applyMatrix4(new THREE.Matrix4().makeRotationFromQuaternion(new THREE.Quaternion().setFromUnitVectors(
+            upVector,
+            new THREE.Vector3(
+              (branchNormals[baseIndex1 + 0] * lerpFactor + branchNormals[baseIndex2 + 0] * inverseLerpFactor),
+              (branchNormals[baseIndex1 + 1] * lerpFactor + branchNormals[baseIndex2 + 1] * inverseLerpFactor),
+              (branchNormals[baseIndex1 + 2] * lerpFactor + branchNormals[baseIndex2 + 2] * inverseLerpFactor)
+            )
+          ))) */
+          .applyMatrix4(new THREE.Matrix4().makeTranslation(
+            (branchPositions[baseIndex1 + 0] * lerpFactor + branchPositions[baseIndex2 + 0] * inverseLerpFactor),
+            (branchPositions[baseIndex1 + 1] * lerpFactor + branchPositions[baseIndex2 + 1] * inverseLerpFactor),
+            (branchPositions[baseIndex1 + 2] * lerpFactor + branchPositions[baseIndex2 + 2] * inverseLerpFactor)
+          ));
+
+        const newPositions = geometry.getAttribute('position').array;
+        positions.set(newPositions, attributeIndex);
+        const newUvs = geometry.getAttribute('uv').array;
+        const numNewUvs = newUvs.length / 2;
+        const tx = Math.floor(1 + (rng() * (NUM_TEXTURE_CHUNKS_WIDTH - 1))); // 0 is trunk textures
+        const ty = Math.floor(rng() * NUM_TEXTURE_CHUNKS_WIDTH);
+        for (let j = 0; j < numNewUvs; j++) {
+          const baseIndex = j * 2;
+          newUvs[baseIndex + 0] = ((tx + (0.02 + newUvs[baseIndex + 0] * 0.96)) / NUM_TEXTURE_CHUNKS_WIDTH);
+          newUvs[baseIndex + 1] = 1 - ((tx + (1 - (0.02 + newUvs[baseIndex + 1] * 0.96))) / NUM_TEXTURE_CHUNKS_WIDTH);
+        }
+        uvs.set(newUvs, uvIndex);
+        const newIndices = geometry.index.array;
+        _copyIndices(newIndices, indices, indexIndex, attributeIndex / 3);
+
+        attributeIndex += newPositions.length;
+        uvIndex += newUvs.length;
+        indexIndex += newIndices.length;
+      }
+    };
+    _renderLeaves(branchGeometrySpec);
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions.buffer, positions.byteOffset, attributeIndex), 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(uvs.buffer, uvs.byteOffset, uvIndex), 2));
+    geometry.setIndex(new THREE.BufferAttribute(new Uint16Array(indices.buffer, indices.byteOffset, indexIndex), 1));
+    return geometry;
+  })();
+
+  return treeGeometry;
+})();
+const _generateHeightfield = (ox, oy) => {
+  const points = Array(NUM_CELLS_OVERSCAN * NUM_CELLS_OVERSCAN);
+  let minHeight = Infinity;
+  let maxHeight = -Infinity;
+
+  for (let dy = 0; dy < NUM_CELLS_OVERSCAN; dy++) {
+    for (let dx = 0; dx < NUM_CELLS_OVERSCAN; dx++) {
+      const index = dx + (dy * NUM_CELLS_OVERSCAN);
+
+      const ax = (ox * NUM_CELLS) + dx;
+      const ay = (oy * NUM_CELLS) + dy;
+      const elevation = (-0.3 + Math.pow(elevationNoise.in2D(ax + 1000, ay + 1000), 0.5)) * 64;
+
+      points[index] = elevation;
+      if (elevation < minHeight) {
+        minHeight = elevation;
+      }
+      if (elevation > maxHeight) {
+        maxHeight = elevation;
+      }
+    }
+  }
+
+  return {
+    points,
+    heightRange: [
+      minHeight,
+      maxHeight,
+    ],
+  };
+};
+
+const _makeTreeChunkGeometry = (ox, oy, treeTemplates, points, heightRange) => {
+  const positions = new Float32Array(NUM_POSITIONS_CHUNK * 3);
+  // const normals = new Float32Array(NUM_POSITIONS_CHUNK * 3);
+  const uvs = new Float32Array(NUM_POSITIONS_CHUNK * 2);
+  const indices = new Uint32Array(NUM_POSITIONS_CHUNK);
+  const trees = new Float32Array(NUM_POSITIONS_CHUNK);
+  let attributeIndex = 0;
+  let uvIndex = 0;
+  let indexIndex = 0;
+  let treeIndex = 0;
+
+  const position = new THREE.Vector3();
+  const quaternion = new THREE.Quaternion();
+  const scale = new THREE.Vector3(1, 1, 1);
+  const matrix = new THREE.Matrix4();
+
+  const treeProbability = 0.015;
+
+  for (let dy = 0; dy < NUM_CELLS_OVERSCAN; dy++) {
+    for (let dx = 0; dx < NUM_CELLS_OVERSCAN; dx++) {
+      const pointIndex = dx + (dy * NUM_CELLS_OVERSCAN);
+      const elevation = points[pointIndex];
+
+      if (elevation > 0) {
+        const ax = (ox * NUM_CELLS) + dx;
+        const ay = (oy * NUM_CELLS) + dy;
+        const v = treeNoise.in2D(dx + 1000, dy + 1000);
+
+        if (v < treeProbability) {
+          position.set(
+            ax,
+            elevation,
+            ay
+          );
+          const n = murmur(String(v)) / 0xFFFFFFFF;
+          quaternion.setFromAxisAngle(upVector, n * Math.PI * 2);
+          matrix.compose(position, quaternion, scale);
+          const geometry = treeTemplates
+            .clone()
+            .applyMatrix4(matrix);
+          const newPositions = geometry.getAttribute('position').array;
+          positions.set(newPositions, attributeIndex);
+          const newUvs = geometry.getAttribute('uv').array;
+          uvs.set(newUvs, uvIndex);
+          const newIndices = geometry.index.array;
+          _copyIndices(newIndices, indices, indexIndex, attributeIndex / 3);
+          const newTrees = Float32Array.from([indexIndex, indexIndex + newIndices.length, position.x, position.y, position.z]);
+          trees.set(newTrees, treeIndex);
+
+          attributeIndex += newPositions.length;
+          uvIndex += newUvs.length;
+          indexIndex += newIndices.length;
+          treeIndex += newTrees.length;
+        }
+      }
+    }
+  }
+
+  return {
+    positions: new Float32Array(positions.buffer, positions.byteOffset, attributeIndex),
+    uvs: new Float32Array(uvs.buffer, uvs.byteOffset, uvIndex),
+    indices: new Uint32Array(indices.buffer, indices.byteOffset, indexIndex),
+    trees: new Float32Array(trees.buffer, trees.byteOffset, treeIndex),
+    heightRange: [
+      heightRange[0],
+      heightRange[1] + 20, // account for tree height
+    ],
+  };
+};
+
+const x = 0;
+const y = 0;
+const z = 0;
+const mapChunk = _generateHeightfield(x, y);
+const {points, heightRange} = mapChunk;
+const treeChunkData = _makeTreeChunkGeometry(x, y, treeTemplates, points, heightRange);
+console.log('got geo', treeChunkData);
+
+const DEFAULT_MATRIX = [
+  0, 0, 0,
+  0, 0, 0, 1,
+  1, 1, 1,
+];
+
+const TREE_SHADER = {
+  uniforms: {
+    map: {
+      type: 't',
+      value: null,
+    },
+    lightMap: {
+      type: 't',
+      value: null,
+    },
+    d: {
+      type: 'v2',
+      value: null,
+    },
+    sunIntensity: {
+      type: 'f',
+      value: 0,
+    },
+  },
+  vertexShader: `\
+precision highp float;
+precision highp int;
+#define USE_COLOR
+/*uniform mat4 modelMatrix;
+uniform mat4 modelViewMatrix;
+uniform mat4 projectionMatrix;
+uniform mat4 viewMatrix;
+uniform mat3 normalMatrix;
+attribute vec3 position;
+attribute vec3 normal;
+attribute vec2 uv; */
+#ifdef USE_COLOR
+  attribute vec3 color;
+#endif
+
+varying vec3 vPosition;
+varying vec3 vViewPosition;
+varying vec2 vUv;
+varying vec3 vNormal;
+#define saturate(a) clamp( a, 0.0, 1.0 )
+
+#ifdef USE_COLOR
+  varying vec3 vColor;
+#endif
+
+void main() {
+#ifdef USE_COLOR
+  vColor.xyz = color.xyz;
+#endif
+
+  vUv = uv;
+  vNormal = normal;
+
+  vec4 mvPosition = modelViewMatrix * vec4( position.xyz, 1.0 );
+  gl_Position = projectionMatrix * mvPosition;
+
+  vPosition = position.xyz;
+  vViewPosition = - mvPosition.xyz;
+}
+`,
+  fragmentShader: `\
+precision highp float;
+precision highp int;
+#define ALPHATEST 0.7
+#define DOUBLE_SIDED
+// uniform mat4 viewMatrix;
+uniform vec3 ambientLightColor;
+uniform sampler2D map;
+uniform sampler2D lightMap;
+uniform vec2 d;
+uniform float sunIntensity;
+
+#define saturate(a) clamp( a, 0.0, 1.0 )
+
+varying vec3 vPosition;
+varying vec3 vViewPosition;
+varying vec2 vUv;
+varying vec3 vNormal;
+
+void main() {
+  vec4 diffuseColor = texture2D( map, vUv );
+
+  float u = (
+    floor(clamp(vPosition.x - d.x, 0.0, ${(NUM_CELLS).toFixed(8)})) +
+    (floor(clamp(vPosition.z - d.y, 0.0, ${(NUM_CELLS).toFixed(8)})) * ${(NUM_CELLS + 1).toFixed(8)}) +
+    0.5
+  ) / (${(NUM_CELLS + 1).toFixed(8)} * ${(NUM_CELLS + 1).toFixed(8)});
+  float v = (floor(vPosition.y - ${HEIGHT_OFFSET.toFixed(8)}) + 0.5) / ${NUM_CELLS_HEIGHT.toFixed(8)};
+  vec3 lightColor = vec3(1.0, 1.0, 1.0); // texture2D( lightMap, vec2(u, v) ).rgb;
+
+#ifdef ALPHATEST
+  if ( diffuseColor.a < ALPHATEST ) discard;
+#endif
+
+#ifdef DOUBLE_SIDED
+  float flipNormal = ( float( gl_FrontFacing ) * 2.0 - 1.0 );
+#else
+  float flipNormal = 1.0;
+#endif
+
+  vec3 outgoingLight = (ambientLightColor * 0.2 + diffuseColor.rgb) * (0.1 + sunIntensity * 0.9) +
+    diffuseColor.rgb * (
+      min((lightColor.rgb - 0.5) * 2.0, 0.0) * sunIntensity +
+      max((lightColor.rgb - 0.5) * 2.0, 0.0) * (1.0 - sunIntensity)
+    );
+
+  gl_FragColor = vec4( outgoingLight, diffuseColor.a );
+}
+`
+};
+
+const mapTextureImg = (() => {
+  const canvas = document.createElement('canvas');
+  canvas.width = TEXTURE_SIZE;
+  canvas.height = TEXTURE_SIZE;
+  const ctx = canvas.getContext('2d');
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  imageData.data.set(new Uint8Array(treeTextureAtlas));
+  ctx.putImageData(imageData, 0, 0); // XXX can be made into imageBitmap
+  return canvas;
+})();
+const mapTexture = new THREE.Texture(
+  mapTextureImg,
+  THREE.UVMapping,
+  THREE.ClampToEdgeWrapping,
+  THREE.ClampToEdgeWrapping,
+  THREE.NearestMipMapLinearFilter,
+  THREE.NearestMipMapLinearFilter,
+  THREE.RGBAFormat,
+  THREE.UnsignedByteType,
+  16
+);
+mapTexture.needsUpdate = true;
+
+const mesh = (() => {
+  const {positions, uvs, indices, heightRange, trees} = treeChunkData;
+
+  const geometry = (() => {
+    let geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+    const [minY, maxY] = heightRange;
+    geometry.boundingSphere = new THREE.Sphere(
+      new THREE.Vector3(
+        (x * NUM_CELLS) + (NUM_CELLS / 2),
+        (minY + maxY) / 2,
+        (z * NUM_CELLS) + (NUM_CELLS / 2)
+      ),
+      Math.max(Math.sqrt((NUM_CELLS / 2) * (NUM_CELLS / 2) * 3), (maxY - minY) / 2)
+    );
+
+    return geometry;
+  })();
+
+  const uniforms = Object.assign(
+    THREE.UniformsUtils.clone(THREE.UniformsLib.lights),
+    THREE.UniformsUtils.clone(TREE_SHADER.uniforms)
+  );
+  uniforms.map.value = mapTexture;
+  uniforms.d.value = new THREE.Vector2(x * NUM_CELLS, z * NUM_CELLS);
+  const material = new THREE.ShaderMaterial({
+    uniforms: uniforms,
+    vertexShader: TREE_SHADER.vertexShader,
+    fragmentShader: TREE_SHADER.fragmentShader,
+    lights: true,
+    side: THREE.DoubleSide,
+    transparent: true,
+  });
+
+  const mesh = new THREE.Mesh(geometry, material);
+  // mesh.frustumCulled = false;
+
+  mesh.offset = new THREE.Vector2(x, z);
+  mesh.trees = trees;
+  mesh.shapes = null;
+
+  return mesh;
+})();
+scene.add(mesh);
+
+function animate() {
+  orbitControls.update();
+
+  renderer.render(scene, camera);
+}
+renderer.setAnimationLoop(animate);
+
+/* let currentSession = null;
+function onSessionStarted(session) {
+  session.addEventListener('end', onSessionEnded);
+
+  renderer.xr.setSession(session);
+
+  currentSession = session;
+}
+function onSessionEnded() {
+  currentSession.removeEventListener('end', onSessionEnded);
+
+  currentSession = null;
+}
+navigator.xr && navigator.xr.requestSession('immersive-vr', {
+  optionalFeatures: [
+    'local-floor',
+    'bounded-floor',
+  ],
+}).then(onSessionStarted); */
+
+</script>
+</body>
+
+</html>
