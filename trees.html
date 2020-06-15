@@ -650,9 +650,9 @@ const _makeTreeChunkGeometry = (ox, oy, treeTemplates, points, heightRange) => {
   for (let dy = 0; dy < NUM_CELLS_OVERSCAN; dy++) {
     for (let dx = 0; dx < NUM_CELLS_OVERSCAN; dx++) {
       const pointIndex = dx + (dy * NUM_CELLS_OVERSCAN);
-      const elevation = points[pointIndex];
+      // const elevation = points[pointIndex];
 
-      if (elevation > 0) {
+      // if (elevation > 0) {
         const ax = (ox * NUM_CELLS) + dx;
         const ay = (oy * NUM_CELLS) + dy;
         const v = treeNoise.in2D(dx + 1000, dy + 1000);
@@ -660,7 +660,7 @@ const _makeTreeChunkGeometry = (ox, oy, treeTemplates, points, heightRange) => {
         if (v < treeProbability) {
           position.set(
             ax,
-            elevation,
+            0, // elevation,
             ay
           );
           const n = murmur(String(v)) / 0xFFFFFFFF;
@@ -683,7 +683,7 @@ const _makeTreeChunkGeometry = (ox, oy, treeTemplates, points, heightRange) => {
           indexIndex += newIndices.length;
           treeIndex += newTrees.length;
         }
-      }
+      // }
     }
   }
 
@@ -698,20 +698,6 @@ const _makeTreeChunkGeometry = (ox, oy, treeTemplates, points, heightRange) => {
     ],
   };
 };
-
-const x = 0;
-const y = 0;
-const z = 0;
-const mapChunk = _generateHeightfield(x, y);
-const {points, heightRange} = mapChunk;
-const treeChunkData = _makeTreeChunkGeometry(x, y, treeTemplates, points, heightRange);
-console.log('got geo', treeChunkData);
-
-const DEFAULT_MATRIX = [
-  0, 0, 0,
-  0, 0, 0, 1,
-  1, 1, 1,
-];
 
 const TREE_SHADER = {
   uniforms: {
@@ -847,52 +833,62 @@ const mapTexture = new THREE.Texture(
 );
 mapTexture.needsUpdate = true;
 
-const mesh = (() => {
-  const {positions, uvs, indices, heightRange, trees} = treeChunkData;
+const y = 0;
+for (let x = -1; x <= 1; x++) {
+  for (let z = -1; z <= 1; z++) {
+    const mapChunk = _generateHeightfield(x, z);
+    const {points, heightRange} = mapChunk;
+    const treeChunkData = _makeTreeChunkGeometry(x, z, treeTemplates, points, heightRange);
+    // console.log('got geo', treeChunkData);
 
-  const geometry = (() => {
-    let geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
-    geometry.setIndex(new THREE.BufferAttribute(indices, 1));
-    const [minY, maxY] = heightRange;
-    geometry.boundingSphere = new THREE.Sphere(
-      new THREE.Vector3(
-        (x * NUM_CELLS) + (NUM_CELLS / 2),
-        (minY + maxY) / 2,
-        (z * NUM_CELLS) + (NUM_CELLS / 2)
-      ),
-      Math.max(Math.sqrt((NUM_CELLS / 2) * (NUM_CELLS / 2) * 3), (maxY - minY) / 2)
-    );
+    const mesh = (() => {
+      const {positions, uvs, indices, heightRange, trees} = treeChunkData;
 
-    return geometry;
-  })();
+      const geometry = (() => {
+        let geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        geometry.setIndex(new THREE.BufferAttribute(indices, 1));
+        const [minY, maxY] = heightRange;
+        geometry.boundingSphere = new THREE.Sphere(
+          new THREE.Vector3(
+            (x * NUM_CELLS) + (NUM_CELLS / 2),
+            (minY + maxY) / 2,
+            (z * NUM_CELLS) + (NUM_CELLS / 2)
+          ),
+          Math.max(Math.sqrt((NUM_CELLS / 2) * (NUM_CELLS / 2) * 3), (maxY - minY) / 2)
+        );
 
-  const uniforms = Object.assign(
-    THREE.UniformsUtils.clone(THREE.UniformsLib.lights),
-    THREE.UniformsUtils.clone(TREE_SHADER.uniforms)
-  );
-  uniforms.map.value = mapTexture;
-  uniforms.d.value = new THREE.Vector2(x * NUM_CELLS, z * NUM_CELLS);
-  const material = new THREE.ShaderMaterial({
-    uniforms: uniforms,
-    vertexShader: TREE_SHADER.vertexShader,
-    fragmentShader: TREE_SHADER.fragmentShader,
-    lights: true,
-    side: THREE.DoubleSide,
-    transparent: true,
-  });
+        return geometry;
+      })();
 
-  const mesh = new THREE.Mesh(geometry, material);
-  // mesh.frustumCulled = false;
+      const uniforms = Object.assign(
+        THREE.UniformsUtils.clone(THREE.UniformsLib.lights),
+        THREE.UniformsUtils.clone(TREE_SHADER.uniforms)
+      );
+      uniforms.map.value = mapTexture;
+      uniforms.d.value = new THREE.Vector2(x * NUM_CELLS, z * NUM_CELLS);
+      const material = new THREE.ShaderMaterial({
+        uniforms: uniforms,
+        vertexShader: TREE_SHADER.vertexShader,
+        fragmentShader: TREE_SHADER.fragmentShader,
+        lights: true,
+        side: THREE.DoubleSide,
+        transparent: true,
+      });
 
-  mesh.offset = new THREE.Vector2(x, z);
-  mesh.trees = trees;
-  mesh.shapes = null;
+      const mesh = new THREE.Mesh(geometry, material);
+      // mesh.frustumCulled = false;
 
-  return mesh;
-})();
-scene.add(mesh);
+      mesh.offset = new THREE.Vector2(x, z);
+      mesh.trees = trees;
+      mesh.shapes = null;
+
+      return mesh;
+    })();
+    scene.add(mesh);
+  }
+}
 
 function animate() {
   orbitControls.update();
