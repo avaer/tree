@@ -719,8 +719,6 @@ const TREE_SHADER = {
     },
   },
   vertexShader: `\
-precision highp float;
-precision highp int;
 #define USE_COLOR
 /*uniform mat4 modelMatrix;
 uniform mat4 modelViewMatrix;
@@ -760,8 +758,6 @@ void main() {
 }
 `,
   fragmentShader: `\
-precision highp float;
-precision highp int;
 #define ALPHATEST 0.7
 #define DOUBLE_SIDED
 // uniform mat4 viewMatrix;
